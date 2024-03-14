@@ -505,7 +505,8 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             # one needs to multiply the number of parameters by 2 to get
             # the correct number of parameters
             if param.__class__.__name__ == "Params4bit":
-                num_params = num_params * 2
+                num_bytes = param.quant_storage.itemsize if hasattr(param, "quant_storage") else 1
+                num_params = num_params * 2 * num_bytes
 
             all_param += num_params
             if param.requires_grad:
@@ -516,6 +517,13 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
     def print_trainable_parameters(self) -> None:
         """
         Prints the number of trainable parameters in the model.
+
+        Note: print_trainable_parameters() uses get_nb_trainable_parameters() which is different from
+        num_parameters(only_trainable=True) from huggingface/transformers. get_nb_trainable_parameters() returns
+        (trainable parameters, all parameters) of the Peft Model which includes modified backbone transformer model.
+        For techniques like LoRA, the backbone transformer model is modified in place with LoRA modules. However, for
+        prompt tuning, the backbone transformer model is unmodified. num_parameters(only_trainable=True) returns number
+        of trainable parameters of the backbone transformer model which can be different.
         """
         trainable_params, all_param = self.get_nb_trainable_parameters()
 
@@ -570,7 +578,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         finally:
             if self.peft_config[self.active_adapter].is_prompt_learning:
                 self.forward = old_forward
-                self.old_prepare_inputs_for_generation = old_prepare_inputs_for_generation
+                self.prepare_inputs_for_generation = old_prepare_inputs_for_generation
             else:
                 self.base_model.enable_adapter_layers()
 
@@ -1153,7 +1161,7 @@ class PeftModelForCausalLM(PeftModel):
             self.base_model.prepare_inputs_for_generation = self.base_model_prepare_inputs_for_generation
             return outputs
 
-    def prepare_inputs_for_generation(self, *args, task_ids: torch.Tensor = None, **kwargs):
+    def prepare_inputs_for_generation(self, *args, task_ids: Optional[torch.Tensor] = None, **kwargs):
         peft_config = self.active_peft_config
         model_kwargs = self.base_model_prepare_inputs_for_generation(*args, **kwargs)
 
@@ -1204,6 +1212,12 @@ class PeftModelForCausalLM(PeftModel):
                     prompts = prompts.to(inputs_embeds.dtype)
                     model_kwargs["inputs_embeds"] = torch.cat((prompts, inputs_embeds), dim=1)
                     model_kwargs["input_ids"] = None
+
+        # For transformers>=4.38.0 - for some architectures such as Llama, `cache_position` is
+        # passed in the forward pass to keep track of the position ids of the cache. We have to
+        # pop that from `model_kwargs` as `cache_position` is properly created by the model, using the passed
+        # `inputs_embeds`: https://github.com/huggingface/transformers/blob/593230f0a1150ea9c0477b9d859f25daf73c8c33/src/transformers/models/llama/modeling_llama.py#L956
+        _ = model_kwargs.pop("cache_position", None)
 
         return model_kwargs
 
